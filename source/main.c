@@ -23,6 +23,14 @@
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
 
+// libnx's default nv transfer-memory pool (used for GPU buffer objects --
+// textures, VBOs, compressed texture uploads, etc. via EGL/Mesa/nouveau) is
+// only ~256MB. That's independent of the newlib/.so heap split above and can
+// be exhausted by world-load texture/geometry streaming in denser areas even
+// when regular heap memory is fine. Bump it explicitly (same fix used by the
+// gtasa_nx Switch port, which hit the same default-pool OOM on world loads).
+u32 __nx_nv_transfermem_size = 0x60000000; // 1.5 GB GPU memory pool
+
 // provide replacement heap init function to separate newlib heap from the .so
 void __libnx_initheap(void)
 {
@@ -126,6 +134,12 @@ int main(void)
 {
   int compat_delay_ms = 0;
 
+  // Persistent Mesa shader cache on the SD card so shaders aren't recompiled
+  // from scratch every boot (same as gtasa_nx's MESA_SHADER_CACHE_DIR setup).
+  mkdir("shadercache", 0777);
+  setenv("MESA_SHADER_CACHE_DIR", "shadercache", 1);
+  setenv("MESA_SHADER_CACHE_DISABLE", "false", 1);
+
   // try to read the config file and create one with default values if it's missing
   if (read_config(CONFIG_NAME) < 0)
     write_config(CONFIG_NAME);
@@ -146,6 +160,7 @@ int main(void)
   debugPrintf("heap size = %u KB\n", MEMORY_MB * 1024);
   debugPrintf(" lib base = %p\n", heap_so_base);
   debugPrintf("  lib max = %u KB\n", heap_so_limit / 1024);
+  debugPrintf("nv GPU transfermem pool = %u MB\n", (unsigned)(__nx_nv_transfermem_size >> 20));
 
   // Load libc++_shared.so first — provides __ndk1 C++ stdlib symbols
   extern int cpplib_load(const char *filename);
