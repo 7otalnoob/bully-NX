@@ -523,3 +523,43 @@ int so_unload(void)
 
   return 0;
 }
+
+// See so_util.h. Reports every loaded module (this .so + the cpplib_loader.c
+// donor, if it's been loaded) to the callback, in the layout bionic/libunwind
+// expect from dl_phdr_info. Both imports.c (the game .so's own import table)
+// and cpplib_loader.c's import table point their "dl_iterate_phdr" slot here
+// instead of a stub that always reports zero modules.
+int so_dl_iterate_phdr(int (*callback)(void *info, size_t size, void *data), void *data)
+{
+  int ret;
+
+  if (elf_hdr && prog_hdr && load_virtbase)
+  {
+    struct so_dl_phdr_info info;
+    info.dlpi_addr = (Elf64_Addr)load_virtbase;
+    info.dlpi_name = SO_NAME;
+    info.dlpi_phdr = prog_hdr; // link-time vaddrs; dlpi_addr is the load bias
+    info.dlpi_phnum = elf_hdr->e_phnum;
+    ret = callback(&info, sizeof(info), data);
+    if (ret)
+      return ret;
+  }
+
+  uintptr_t cpp_virtbase;
+  const char *cpp_name;
+  const Elf64_Phdr *cpp_phdr;
+  int cpp_phnum;
+  if (cpplib_get_phdr_info(&cpp_virtbase, &cpp_name, &cpp_phdr, &cpp_phnum))
+  {
+    struct so_dl_phdr_info info;
+    info.dlpi_addr = (Elf64_Addr)cpp_virtbase;
+    info.dlpi_name = cpp_name;
+    info.dlpi_phdr = cpp_phdr;
+    info.dlpi_phnum = cpp_phnum;
+    ret = callback(&info, sizeof(info), data);
+    if (ret)
+      return ret;
+  }
+
+  return 0;
+}

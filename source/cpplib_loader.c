@@ -50,6 +50,13 @@ static Elf64_Sym *cpplib_syms = NULL;
 static char *cpplib_dynstrtab = NULL;
 static int cpplib_num_syms = 0;
 
+// persisted copy of the (unmodified, link-time-vaddr) program headers, needed
+// after file_buf is freed so so_dl_iterate_phdr() can report this module --
+// see cpplib_get_phdr_info() below.
+#define CPPLIB_MAX_PHDRS 16
+static Elf64_Phdr cpplib_phdr[CPPLIB_MAX_PHDRS];
+static int cpplib_phnum = 0;
+
 extern void *memalign_wrapper(size_t alignment, size_t size);
 extern void *realloc_wrapper(void *ptr, size_t size);
 extern void free_wrapper(void *ptr);
@@ -64,11 +71,6 @@ static int __system_property_get_stub(const char *name, char *value)
 static void android_set_abort_message_stub(const char *msg)
 {
   debugPrintf("abort: %s\n", msg);
-}
-
-static int dl_iterate_phdr_stub(void *callback, void *data)
-{
-  return 0;
 }
 
 static unsigned long getauxval_stub(unsigned long type)
@@ -393,7 +395,7 @@ static DynLibFunction cpplib_imports[] = {
     {"__system_property_get", (uintptr_t)&__system_property_get_stub},
     {"__system_property_find", (uintptr_t)&__system_property_find_stub},
     {"android_set_abort_message", (uintptr_t)&android_set_abort_message_stub},
-    {"dl_iterate_phdr", (uintptr_t)&dl_iterate_phdr_stub},
+    {"dl_iterate_phdr", (uintptr_t)&so_dl_iterate_phdr},
     {"getauxval", (uintptr_t)&getauxval_stub},
     {"__assert2", (uintptr_t)&__assert2_stub},
     {"__ctype_get_mb_cur_max", (uintptr_t)&__ctype_get_mb_cur_max_stub},
@@ -598,6 +600,12 @@ int cpplib_load(const char *filename)
   cpplib_dynstrtab = local_dynstr;
   cpplib_num_syms = local_num_syms;
 
+  // Persist the program headers (unmodified, link-time vaddrs) now, while
+  // file_buf/phdr are still valid -- they're freed at the end of this
+  // function, but dl_iterate_phdr callers may need this long after.
+  cpplib_phnum = ehdr->e_phnum < CPPLIB_MAX_PHDRS ? ehdr->e_phnum : CPPLIB_MAX_PHDRS;
+  memcpy(cpplib_phdr, phdr, cpplib_phnum * sizeof(Elf64_Phdr));
+
   // Apply relocations
   for (int i = 0; i < ehdr->e_shnum; i++)
   {
@@ -785,4 +793,24 @@ int cpplib_resolve_symbol(const char *name, uintptr_t *out_addr)
     return 1;
   }
   return 0;
+}
+
+// See cpplib_loader.h. cpplib_virtbase is where the module actually executes
+// from, matching what so_dl_iterate_phdr should report as dlpi_addr (the
+// load bias to add to the link-time vaddrs in cpplib_phdr).
+int cpplib_get_phdr_info(uintptr_t *out_virtbase, const char **out_name,
+                          const Elf64_Phdr **out_phdr, int *out_phnum)
+{
+  if (!cpplib_virtbase)
+    return 0;
+
+  if (out_virtbase)
+    *out_virtbase = (uintptr_t)cpplib_virtbase;
+  if (out_name)
+    *out_name = "libc++_shared.so";
+  if (out_phdr)
+    *out_phdr = cpplib_phdr;
+  if (out_phnum)
+    *out_phnum = cpplib_phnum;
+  return 1;
 }

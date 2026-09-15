@@ -2524,7 +2524,7 @@ DynLibFunction dynlib_functions[] = {
     {"syscall", (uintptr_t)&syscall_wrapper},
     {"getauxval", (uintptr_t)&ret0},
     {"__system_property_get", (uintptr_t)&ret0},
-    {"dl_iterate_phdr", (uintptr_t)&ret0},
+    {"dl_iterate_phdr", (uintptr_t)&so_dl_iterate_phdr},
 
     // Thread-local game globals (harmless stubs)
     {"_ZTH7gString", (uintptr_t)&ret0},
