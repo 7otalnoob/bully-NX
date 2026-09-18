@@ -482,6 +482,73 @@ static DynLibFunction cpplib_imports[] = {
 
 #define CPPLIB_NUM_IMPORTS (sizeof(cpplib_imports) / sizeof(DynLibFunction))
 
+// ---------------------------------------------------------------------------
+// Targeted fix for a real crash observed on hardware: Bully's
+// ActionController::Update -> ... -> ActionContext::PlayOpeningBranch calls
+// __dynamic_cast, which (on this exact libc++_shared.so build) walks into an
+// internal __class_type_info-family helper that dereferences its "info"
+// argument (x1) unconditionally. On this specific game build, that argument
+// arrives as NULL along this call path, causing a Data Abort at address
+// 0x10 (crash report: "[00000000] + 0x9e55c", inside libc++_shared.so).
+//
+// This is a faithful, offset-for-offset reimplementation of that helper
+// (reconstructed from disassembly of the game's own libc++_shared.so), with
+// exactly one change: it fails the cast gracefully (returns NULL) when info
+// is NULL, instead of dereferencing it. Returning "not a match" is completely
+// normal, expected dynamic_cast behavior -- this does not change the result
+// of any dynamic_cast that isn't already hitting this NULL-info edge case.
+//
+// CAUTION: the offset below (and the field offsets inside the function) are
+// tied to this exact libc++_shared.so build (BuildID
+// a3e3ad0a8d58b8363ddd6d1bd76a5ad54f2c29ad). If the game/APK's bundled
+// libc++_shared.so is ever replaced with a different NDK/libc++ version,
+// this offset needs to be re-derived from the new binary before this patch
+// still applies correctly.
+#define CPPLIB_DYNCAST_HELPER_OFFSET 0x9e558
+
+static void *cpplib_dyncast_helper_fixed(void *self, char *info, void *current_ptr, uint32_t path_below)
+{
+  if (!info)
+    return NULL; // guard: original code unconditionally read info+0x10 here
+
+  void *self_field8 = *(void **)((char *)self + 8);
+  void *static_type = *(void **)(info + 0x10);
+  void *static_type_field8 = *(void **)((char *)static_type + 8);
+
+  if (self_field8 == static_type_field8)
+  {
+    void *dst_ptr = *(void **)(info + 0x20);
+    if (dst_ptr == NULL)
+    {
+      *(void **)(info + 0x20) = current_ptr;
+      *(uint32_t *)(info + 0x30) = path_below;
+      *(uint32_t *)(info + 0x3c) = 1;
+    }
+    else if (dst_ptr == current_ptr)
+    {
+      if (*(uint32_t *)(info + 0x30) == 2)
+        *(uint32_t *)(info + 0x30) = path_below;
+    }
+    else
+    {
+      uint32_t cnt = *(uint32_t *)(info + 0x3c);
+      *(uint32_t *)(info + 0x30) = 2;
+      *(uint8_t *)(info + 0x4e) = 1;
+      *(uint32_t *)(info + 0x3c) = cnt + 1;
+    }
+    return self;
+  }
+  else
+  {
+    // tail-recurse into the base class's own copy of this same virtual slot
+    void *next_self = *(void **)((char *)self + 0x10);
+    void **vtable = *(void **)next_self;
+    typedef void *(*fn_t)(void *, char *, void *, uint32_t);
+    fn_t fn = (fn_t)vtable[0x38 / 8];
+    return fn(next_self, info, current_ptr, path_below);
+  }
+}
+
 int cpplib_load(const char *filename)
 {
   FILE *fd = fopen(filename, "rb");
@@ -705,6 +772,15 @@ int cpplib_load(const char *filename)
   }
 
   debugPrintf("cpplib: loaded %d symbols (%d defined funcs)\n", cpplib_num_syms, defined_count);
+
+  // Patch a specific internal RTTI helper (see cpplib_dyncast_helper_fixed
+  // above) now that relocations are applied, while the buffer is still
+  // writable (before permissions lock to RX just below).
+  {
+    uintptr_t patch_addr = (uintptr_t)cpplib_base + (CPPLIB_DYNCAST_HELPER_OFFSET - min_vaddr);
+    hook_arm64(patch_addr, (uintptr_t)&cpplib_dyncast_helper_fixed);
+    debugPrintf("cpplib: patched dynamic_cast helper at file-offset +0x%x\n", CPPLIB_DYNCAST_HELPER_OFFSET);
+  }
 
   // Make code executable via svcMapProcessCodeMemory (same as so_finalize)
   debugPrintf("cpplib: mapping code at %p -> %p\n", cpplib_base, cpplib_virtbase);

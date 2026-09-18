@@ -62,41 +62,28 @@ CXXFLAGS	:= $(CFLAGS)
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-# Prefer a mounted custom Mesa build when present.
-# Example:
-#   docker run ... -v /path/to/mesa/build:/mesa-new ...
-CUSTOM_MESA_ROOT ?=
-ifeq ($(strip $(CUSTOM_MESA_ROOT)),)
-ifneq ($(wildcard /mesa-new/src/egl/libEGL.a),)
-CUSTOM_MESA_ROOT := /mesa-new
-else ifneq ($(wildcard /mesa-new/build/src/egl/libEGL.a),)
-CUSTOM_MESA_ROOT := /mesa-new/build
-endif
-endif
-
-CUSTOM_MESA_EGL := $(CUSTOM_MESA_ROOT)/src/egl/libEGL.a
-CUSTOM_MESA_GLES := $(firstword $(wildcard $(CUSTOM_MESA_ROOT)/src/mapi/es2api/libGLESv2*.a))
-CUSTOM_MESA_GLAPI := $(CUSTOM_MESA_ROOT)/src/mapi/shared-glapi/libglapi.a
-CUSTOM_MESA_WINSYS := $(firstword $(wildcard $(CUSTOM_MESA_ROOT)/src/gallium/winsys/nouveau/switch/libnouveauwinsys.a))
-CUSTOM_MESA_NOUVEAU := $(firstword $(wildcard $(CUSTOM_MESA_ROOT)/src/gallium/drivers/nouveau/libnouveau.a))
-CUSTOM_MESA_DRM := $(CUSTOM_MESA_ROOT)/libdrm_nouveau/lib/libdrm_nouveau.a
-CUSTOM_MESA_REQUIRED := $(CUSTOM_MESA_EGL) $(CUSTOM_MESA_GLES) $(CUSTOM_MESA_GLAPI) $(CUSTOM_MESA_DRM)
-
-USE_CUSTOM_MESA := 0
-ifneq ($(strip $(CUSTOM_MESA_ROOT)),)
-ifeq ($(strip $(filter-out $(wildcard $(CUSTOM_MESA_REQUIRED)),$(CUSTOM_MESA_REQUIRED))),)
-USE_CUSTOM_MESA := 1
-$(info Using custom Mesa archives from $(CUSTOM_MESA_ROOT))
+# Mesa/EGL/GLESv2 SDK for Switch, built via NaGaa95/mesa-switch's
+# build-opengl.sh (https://github.com/NaGaa95/mesa-switch), staged the same
+# way gtasa_nx consumes it (MESA_SDK_ROOT -> <root>/include, <root>/lib).
+# The devkitPro portlibs stock Mesa is known NOT to boot this game (black
+# screen, no crash report) -- the fallback below is for local lint/dev builds
+# only, never for something you intend to actually run on hardware.
+MESA_SDK_ROOT ?= $(TOPDIR)/mesa-install/opt/devkitpro/portlibs/switch
+ifneq ($(wildcard $(MESA_SDK_ROOT)/lib/libEGL.a),)
+USE_MESA_SDK := 1
+$(info Using Mesa SDK from $(MESA_SDK_ROOT))
 else
-$(warning Custom Mesa requested at $(CUSTOM_MESA_ROOT) but required archives are missing; falling back to devkitPro portlibs Mesa)
-endif
+USE_MESA_SDK := 0
+$(warning Mesa SDK not found at $(MESA_SDK_ROOT); falling back to devkitPro portlibs Mesa -- KNOWN NOT TO BOOT THIS GAME, dev/lint builds only)
 endif
 
-ifeq ($(USE_CUSTOM_MESA),1)
-MESA_LIBS := $(CUSTOM_MESA_EGL) $(CUSTOM_MESA_GLES) $(CUSTOM_MESA_GLAPI) \
-             $(CUSTOM_MESA_WINSYS) $(CUSTOM_MESA_NOUVEAU) $(CUSTOM_MESA_DRM)
+ifeq ($(USE_MESA_SDK),1)
+# mesa-switch's Horizon backend is self-contained; no external -ldrm_nouveau.
+MESA_LIBS := -lEGL -lGLESv2 -lglapi
+LIBDIRS_MESA := $(MESA_SDK_ROOT)
 else
 MESA_LIBS := -lEGL -lGLESv2 -lglapi -ldrm_nouveau
+LIBDIRS_MESA :=
 endif
 
 LIBS	:= -lopenal -lSDL2 $(MESA_LIBS) -lminizip -lz -lnx -lm -lzstd
@@ -105,7 +92,7 @@ LIBS	:= -lopenal -lSDL2 $(MESA_LIBS) -lminizip -lz -lnx -lm -lzstd
 # list of directories containing libraries, this must be the top level containing
 # include and lib
 #---------------------------------------------------------------------------------
-LIBDIRS	:= $(PORTLIBS) $(LIBNX)
+LIBDIRS	:= $(LIBDIRS_MESA) $(PORTLIBS) $(LIBNX)
 
 
 #---------------------------------------------------------------------------------
