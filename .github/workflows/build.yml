@@ -72,12 +72,11 @@ jobs:
             -v "${{ github.workspace }}:/project" \
             --workdir /project \
             devkitpro/devkita64 \
-            sh -lc 'make clean && make -j$(nproc)'
+            sh -lc 'make clean && make -j$(nproc) TARGET=bully_nx'
 
       - name: Collect output
         run: |
           mkdir -p out
-          rm -f bully_nx.nro  # binario viejo pre-existente, no es del build actual
           find . -maxdepth 1 \( -name "*.nro" -o -name "*.elf" -o -name "*.nacp" \) -exec cp {} out/ \;
           ls -la out
 
