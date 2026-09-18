@@ -1,1 +1,97 @@
+name: build-switch
 
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-mesa:
+    runs-on: ubuntu-latest
+    outputs:
+      cache-key: ${{ steps.mesa-src.outputs.cache-key }}
+    steps:
+      - name: Checkout mesa-switch
+        run: |
+          git clone --depth 1 https://github.com/NaGaa95/mesa-switch.git mesa-switch
+          echo "cache-key=mesa-install-$(git -C mesa-switch rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        id: mesa-src
+
+      - name: Cache built Mesa SDK
+        id: mesa-cache
+        uses: actions/cache@v4
+        with:
+          path: mesa-switch/mesa-install
+          key: ${{ steps.mesa-src.outputs.cache-key }}
+
+      - name: Build Mesa OpenGL/EGL SDK for Switch
+        if: steps.mesa-cache.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}/mesa-switch:/mesa-switch" \
+            --workdir /mesa-switch \
+            devkitpro/devkita64 \
+            bash -lc '
+              set -euo pipefail
+              apt-get update
+              apt-get install -y python3-pip python3-yaml python3-mako ninja-build bison flex
+              pip3 install --break-system-packages "meson>=1.4.0"
+              for i in 1 2 3 4 5; do
+                dkp-pacman -Sy --noconfirm switch-zlib switch-libzstd switch-libexpat switch-pkg-config && break
+                echo "dkp-pacman falló (intento $i/5), reintentando en 15s..."
+                sleep 15
+              done
+              ./build-opengl.sh
+            '
+
+      - name: Upload Mesa SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-sdk
+          path: mesa-switch/mesa-install
+          retention-days: 14
+
+  build:
+    needs: build-mesa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Mesa SDK
+        uses: actions/download-artifact@v4
+        with:
+          name: mesa-sdk
+          path: mesa-install
+
+      - name: Build with devkitA64
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/project" \
+            --workdir /project \
+            devkitpro/devkita64 \
+            sh -lc 'make clean && make -j$(nproc)'
+
+      - name: Collect output
+        run: |
+          mkdir -p out
+          rm -f bully_nx.nro  # binario viejo pre-existente, no es del build actual
+          find . -maxdepth 1 \( -name "*.nro" -o -name "*.elf" -o -name "*.nacp" \) -exec cp {} out/ \;
+          ls -la out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bully-nx-build
+          path: out/*
+
+      - name: Publish as release (públicamente descargable)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest-build --yes || true
+          git tag -f latest-build
+          git push -f origin latest-build
+          gh release create latest-build out/* --title "Latest automated build" --notes "Auto-built from commit ${{ github.sha }}" --prerelease
