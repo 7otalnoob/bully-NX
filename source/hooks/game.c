@@ -580,6 +580,13 @@ static const char *ActionTreeDecoder_decodeStringRef_hook(void *this_ptr)
 #define STACK_CHK_FAIL_PLT 0x11787e0
 #define NOP_INSN 0xD503201F
 
+typedef struct { uint32_t target; int idx; } BneEntry;
+
+static int bne_entry_cmp(const void *a, const void *b) {
+  uint32_t ta = ((const BneEntry *)a)->target, tb = ((const BneEntry *)b)->target;
+  return (ta > tb) - (ta < tb);
+}
+
 static void patch_stack_canary(void) {
   uint32_t *code = (uint32_t *)text_base;
   int text_insns = (int)(text_size / 4);
@@ -587,12 +594,38 @@ static void patch_stack_canary(void) {
   int patched_bl = 0;
   int unmatched_bl = 0;
 
-  // How far back to look for a guarding b.ne. 512 instructions (2KB) missed
-  // ~100 of ~8386 call sites in practice -- some protected functions (or
-  // groups of functions sharing one fail call) span more than that. 16384
-  // (64KB) comfortably covers even large functions; this is a one-time
-  // startup scan so the extra search cost doesn't matter.
-#define CANARY_GUARD_SEARCH_WINDOW 16384
+  // Two-pass approach instead of a per-bl backward scan: collect every b.ne
+  // branch's target address once, sort by target, then look up each bl's
+  // guard(s) with a binary search. This finds every guarding b.ne (no
+  // window/distance limit at all, so nothing can be missed regardless of how
+  // far apart a function's check and its shared fail call are) while doing
+  // O(n) + O(m log m) work instead of O(bl_count * window) -- the original
+  // per-bl 16384-instruction backward scan, repeated for all ~8386 call
+  // sites, was taking a large and unnecessary chunk of startup time.
+
+  int bne_count = 0;
+  for (int i = 0; i < text_insns; i++) {
+    if ((code[i] & 0xFF00001F) == 0x54000001) // B.NE
+      bne_count++;
+  }
+
+  BneEntry *bne_list = bne_count ? malloc(sizeof(BneEntry) * bne_count) : NULL;
+  if (bne_list) {
+    int n = 0;
+    for (int i = 0; i < text_insns; i++) {
+      uint32_t insn = code[i];
+      if ((insn & 0xFF00001F) != 0x54000001)
+        continue;
+      int32_t imm19 = (int32_t)((insn >> 5) & 0x7FFFF);
+      if (imm19 & 0x40000)
+        imm19 |= (int32_t)0xFFF80000; // sign-extend
+      bne_list[n].target = (uint32_t)((int64_t)(i * 4) + ((int64_t)imm19 << 2));
+      bne_list[n].idx = i;
+      n++;
+    }
+
+    qsort(bne_list, bne_count, sizeof(BneEntry), bne_entry_cmp);
+  }
 
   for (int i = 0; i < text_insns; i++) {
     uint32_t insn = code[i];
@@ -617,37 +650,41 @@ static void patch_stack_canary(void) {
     code[i] = NOP_INSN;
     patched_bl++;
 
-    // Search backward for EVERY b.ne targeting this bl -- do not stop at the
-    // first match. Multiple stack-protected paths (or multiple functions,
-    // via jump-threading) can share one fail call site, each with its own
-    // guarding b.ne; leaving any of them un-patched means it can still fire
-    // on a spurious TLS-canary mismatch and jump straight into the NOP we
-    // just placed, falling through into whatever code happens to follow --
-    // which the compiler assumed was unreachable, since __stack_chk_fail is
-    // noreturn. That's a corrupted-execution bug, not a safe no-op.
+    // Binary-search bne_list for bl_vaddr, then sweep both directions since
+    // sort only guarantees equal-target entries are contiguous, not ordered.
     int found_guard = 0;
-    for (int j = i - 1; j >= 0 && j >= i - CANARY_GUARD_SEARCH_WINDOW; j--) {
-      uint32_t prev = code[j];
-      // Check B.NE: (prev & 0xFF00001F) == 0x54000001
-      if ((prev & 0xFF00001F) != 0x54000001)
-        continue;
-      int32_t imm19 = (int32_t)((prev >> 5) & 0x7FFFF);
-      if (imm19 & 0x40000)
-        imm19 |= (int32_t)0xFFF80000; // sign-extend
-      uint32_t branch_target =
-          (uint32_t)((int64_t)(j * 4) + ((int64_t)imm19 << 2));
-      if (branch_target == bl_vaddr) {
-        code[j] = NOP_INSN;
-        patched_bne++;
-        found_guard = 1;
-        // keep scanning further back -- don't break, there may be more
+    if (bne_list) {
+      int lo = 0, hi = bne_count - 1, mid_hit = -1;
+      while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (bne_list[mid].target == bl_vaddr) { mid_hit = mid; break; }
+        else if (bne_list[mid].target < bl_vaddr) lo = mid + 1;
+        else hi = mid - 1;
+      }
+      if (mid_hit >= 0) {
+        int k = mid_hit;
+        while (k >= 0 && bne_list[k].target == bl_vaddr) {
+          code[bne_list[k].idx] = NOP_INSN;
+          patched_bne++;
+          found_guard = 1;
+          k--;
+        }
+        k = mid_hit + 1;
+        while (k < bne_count && bne_list[k].target == bl_vaddr) {
+          code[bne_list[k].idx] = NOP_INSN;
+          patched_bne++;
+          found_guard = 1;
+          k++;
+        }
       }
     }
     if (!found_guard) {
       unmatched_bl++;
-      debugPrintf("patch_stack_canary: WARNING no guard b.ne found for bl at 0x%x (widen search window?)\n", bl_vaddr);
+      debugPrintf("patch_stack_canary: WARNING no guard b.ne found for bl at 0x%x\n", bl_vaddr);
     }
   }
+
+  free(bne_list);
 
   debugPrintf(
       "patch_stack_canary: disabled %d canary checks (%d b.ne + %d bl), %d bl with no guard found\n",
