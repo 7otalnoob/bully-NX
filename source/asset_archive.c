@@ -12,8 +12,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
 
 #include "util.h"
 
@@ -62,7 +60,6 @@ typedef struct
   long start;
   long size;
   long pos;
-  char *vbuf; // large stdio buffer for SLICE handles (see asset_handle_from_slice); NULL otherwise
 } AssetHandle;
 
 static ZipIndexEntry *g_zip_entries;
@@ -294,22 +291,11 @@ static AssetHandle *asset_handle_from_file(FILE *fp)
   return handle;
 }
 
-// Slice handles do many small fseek+fread calls against the same underlying
-// data_N.zip while the game streams world sectors (see NvF*/NvAPK* hooks in
-// hooks/game.c). On Switch each of those is a real fsdev IPC round trip, not
-// a cheap libc call like on PC/Android, so give the stream a large buffer:
-// stdio then only has to hit fsdev when it actually crosses a 128KB boundary
-// instead of on every single small read/seek. The buffer's lifetime is tied
-// to the handle (freed in asset_close), so it's always safe regardless of
-// how many slice handles are open concurrently.
-#define ASSET_SLICE_STREAM_BUFSZ (128 * 1024)
-
 static AssetHandle *asset_handle_from_slice(const char *zip_name, uint32_t start, uint32_t size)
 {
   char fullpath[128];
   FILE *fp;
   AssetHandle *handle;
-  char *vbuf;
 
   snprintf(fullpath, sizeof(fullpath), ASSET_ROOT "%s", zip_name);
   fp = fopen(fullpath, "rb");
@@ -323,17 +309,12 @@ static AssetHandle *asset_handle_from_slice(const char *zip_name, uint32_t start
     return NULL;
   }
 
-  vbuf = malloc(ASSET_SLICE_STREAM_BUFSZ);
-  if (vbuf)
-    setvbuf(fp, vbuf, _IOFBF, ASSET_SLICE_STREAM_BUFSZ);
-
   handle->magic = HANDLE_MAGIC;
   handle->kind = ASSET_HANDLE_SLICE;
   handle->fp = fp;
   handle->start = (long)start;
   handle->size = (long)size;
   handle->pos = 0;
-  handle->vbuf = vbuf;
   return handle;
 }
 
@@ -430,125 +411,17 @@ int asset_archive_init(void)
   return g_asset_archive_ready;
 }
 
-// ---------------------------------------------------------------------------
-// loose-asset existence index -- almost nothing lives loose under assets/
-// (real game data comes from the zip index / img packs above), so
-// open_loose_asset() used to spend two real fopen() probes -- both destined
-// to fail -- on *every single* asset_open() call before it ever reached the
-// zip. Each failed fopen() is still a real fsdev IPC round trip on Switch.
-// Scan assets/ once at startup into a sorted in-memory list and answer
-// probes from that instead; only do a real fopen() when the index actually
-// says the file is there (e.g. a dropped-in mod override).
-// ---------------------------------------------------------------------------
-
-static char **g_loose_index;
-static size_t g_loose_index_count;
-static size_t g_loose_index_cap;
-static int g_loose_index_ready;
-
-static void loose_index_add(const char *relpath)
-{
-  char normalized[512];
-  if (g_loose_index_count == g_loose_index_cap)
-  {
-    size_t new_cap = g_loose_index_cap ? g_loose_index_cap * 2 : 256;
-    char **grown = realloc(g_loose_index, new_cap * sizeof(*grown));
-    if (!grown)
-      return;
-    g_loose_index = grown;
-    g_loose_index_cap = new_cap;
-  }
-  normalize_path(normalized, sizeof(normalized), relpath);
-  char *copy = malloc(strlen(normalized) + 1);
-  if (!copy)
-    return;
-  memcpy(copy, normalized, strlen(normalized) + 1);
-  g_loose_index[g_loose_index_count++] = copy;
-}
-
-static void loose_index_scan_dir(const char *dir, size_t root_len)
-{
-  DIR *d = opendir(dir);
-  struct dirent *e;
-  char path[768];
-
-  if (!d)
-    return;
-
-  while ((e = readdir(d)) != NULL)
-  {
-    if (e->d_name[0] == '.' &&
-        (e->d_name[1] == '\0' || (e->d_name[1] == '.' && e->d_name[2] == '\0')))
-      continue;
-
-    snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-
-    struct stat st;
-    if (stat(path, &st) != 0)
-      continue;
-
-    if (S_ISDIR(st.st_mode))
-    {
-      loose_index_scan_dir(path, root_len);
-    }
-    else
-    {
-      // store relative to assets/ (ASSET_ROOT), matching what open_loose_asset is asked for
-      loose_index_add(path + root_len);
-    }
-  }
-
-  closedir(d);
-}
-
-static int loose_index_cmp(const void *a, const void *b)
-{
-  return strcmp(*(const char *const *)a, *(const char *const *)b);
-}
-
-static int loose_index_lookup_cmp(const void *key, const void *elem)
-{
-  return strcmp((const char *)key, *(const char *const *)elem);
-}
-
-static void loose_index_build(void)
-{
-  if (g_loose_index_ready)
-    return;
-  g_loose_index_ready = 1;
-  // "assets" (no trailing slash) as scan root; root_len includes the '/'
-  // separator so path + root_len yields a clean relative path with no
-  // leading slash, matching what open_loose_asset looks up.
-  loose_index_scan_dir("assets", strlen("assets") + 1);
-  if (g_loose_index_count)
-    qsort(g_loose_index, g_loose_index_count, sizeof(*g_loose_index), loose_index_cmp);
-  debugPrintf("asset_archive: indexed %zu loose files under " ASSET_ROOT "\n", g_loose_index_count);
-}
-
-static int loose_index_exists(const char *relpath_raw)
-{
-  char normalized[512];
-  normalize_path(normalized, sizeof(normalized), relpath_raw);
-  return bsearch(normalized, g_loose_index, g_loose_index_count,
-                 sizeof(*g_loose_index), loose_index_lookup_cmp) != NULL;
-}
-
 static AssetHandle *open_loose_asset(const char *path, const char *normalized_path)
 {
   char fullpath[768];
   FILE *fp;
 
-  loose_index_build();
+  snprintf(fullpath, sizeof(fullpath), ASSET_ROOT "%s", path);
+  fp = fopen(fullpath, "rb");
+  if (fp)
+    return asset_handle_from_file(fp);
 
-  if (loose_index_exists(path))
-  {
-    snprintf(fullpath, sizeof(fullpath), ASSET_ROOT "%s", path);
-    fp = fopen(fullpath, "rb");
-    if (fp)
-      return asset_handle_from_file(fp);
-  }
-
-  if (strcmp(path, normalized_path) != 0 && loose_index_exists(normalized_path))
+  if (strcmp(path, normalized_path) != 0)
   {
     snprintf(fullpath, sizeof(fullpath), ASSET_ROOT "%s", normalized_path);
     fp = fopen(fullpath, "rb");
@@ -675,9 +548,7 @@ void asset_close(void *opaque)
   if (!handle || handle->magic != HANDLE_MAGIC)
     return;
   if (handle->fp)
-    fclose(handle->fp); // must close before freeing vbuf -- stdio may still flush/reference it
-  if (handle->vbuf)
-    free(handle->vbuf);
+    fclose(handle->fp);
   free(handle);
 }
 

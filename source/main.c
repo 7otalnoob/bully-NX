@@ -23,14 +23,6 @@
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
 
-// NOTE: previously tried overriding __nx_nv_transfermem_size here (bumped to
-// 1.5 GB, mirroring gtasa_nx) as an untested, cheap-to-try fix for a
-// hypothetical GPU memory bottleneck. Reverted: it made the app fail to boot
-// at all (black screen, no crash report -- this reservation happens before
-// our own code/logging even runs, so a failure here is invisible to us).
-// The original repo never overrode this and booted fine, so leave it at the
-// libnx default unless we get a concrete, confirmed reason to touch it again.
-
 // provide replacement heap init function to separate newlib heap from the .so
 void __libnx_initheap(void)
 {
@@ -133,12 +125,6 @@ static void set_screen_size(int w, int h)
 int main(void)
 {
   int compat_delay_ms = 0;
-
-  // Persistent Mesa shader cache on the SD card so shaders aren't recompiled
-  // from scratch every boot (same as gtasa_nx's MESA_SHADER_CACHE_DIR setup).
-  mkdir("shadercache", 0777);
-  setenv("MESA_SHADER_CACHE_DIR", "shadercache", 1);
-  setenv("MESA_SHADER_CACHE_DISABLE", "false", 1);
 
   // try to read the config file and create one with default values if it's missing
   if (read_config(CONFIG_NAME) < 0)
