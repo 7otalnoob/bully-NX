@@ -585,6 +585,14 @@ static void patch_stack_canary(void) {
   int text_insns = (int)(text_size / 4);
   int patched_bne = 0;
   int patched_bl = 0;
+  int unmatched_bl = 0;
+
+  // How far back to look for a guarding b.ne. 512 instructions (2KB) missed
+  // ~100 of ~8386 call sites in practice -- some protected functions (or
+  // groups of functions sharing one fail call) span more than that. 16384
+  // (64KB) comfortably covers even large functions; this is a one-time
+  // startup scan so the extra search cost doesn't matter.
+#define CANARY_GUARD_SEARCH_WINDOW 16384
 
   for (int i = 0; i < text_insns; i++) {
     uint32_t insn = code[i];
@@ -609,10 +617,16 @@ static void patch_stack_canary(void) {
     code[i] = NOP_INSN;
     patched_bl++;
 
-    // Search backward for b.ne targeting this bl
-    // B.cond encoding: 0101 0100 imm19:0 cond
-    // B.NE has cond=0001
-    for (int j = i - 1; j >= 0 && j >= i - 512; j--) {
+    // Search backward for EVERY b.ne targeting this bl -- do not stop at the
+    // first match. Multiple stack-protected paths (or multiple functions,
+    // via jump-threading) can share one fail call site, each with its own
+    // guarding b.ne; leaving any of them un-patched means it can still fire
+    // on a spurious TLS-canary mismatch and jump straight into the NOP we
+    // just placed, falling through into whatever code happens to follow --
+    // which the compiler assumed was unreachable, since __stack_chk_fail is
+    // noreturn. That's a corrupted-execution bug, not a safe no-op.
+    int found_guard = 0;
+    for (int j = i - 1; j >= 0 && j >= i - CANARY_GUARD_SEARCH_WINDOW; j--) {
       uint32_t prev = code[j];
       // Check B.NE: (prev & 0xFF00001F) == 0x54000001
       if ((prev & 0xFF00001F) != 0x54000001)
@@ -625,14 +639,19 @@ static void patch_stack_canary(void) {
       if (branch_target == bl_vaddr) {
         code[j] = NOP_INSN;
         patched_bne++;
-        break;
+        found_guard = 1;
+        // keep scanning further back -- don't break, there may be more
       }
+    }
+    if (!found_guard) {
+      unmatched_bl++;
+      debugPrintf("patch_stack_canary: WARNING no guard b.ne found for bl at 0x%x (widen search window?)\n", bl_vaddr);
     }
   }
 
   debugPrintf(
-      "patch_stack_canary: disabled %d canary checks (%d b.ne + %d bl)\n",
-      patched_bne + patched_bl, patched_bne, patched_bl);
+      "patch_stack_canary: disabled %d canary checks (%d b.ne + %d bl), %d bl with no guard found\n",
+      patched_bne + patched_bl, patched_bne, patched_bl, unmatched_bl);
 }
 
 // ============================================================================

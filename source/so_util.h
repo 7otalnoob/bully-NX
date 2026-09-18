@@ -10,6 +10,7 @@
 #define __SO_UTIL_H__
 
 #include <stdint.h>
+#include <elf.h>
 
 #define ALIGN_MEM(x, align) (((x) + ((align) - 1)) & ~((align) - 1))
 
@@ -18,6 +19,15 @@ typedef struct
   char *symbol;
   uintptr_t func;
 } DynLibFunction;
+
+// matches the layout bionic/libunwind expect from dl_phdr_info
+struct so_dl_phdr_info
+{
+  Elf64_Addr dlpi_addr;
+  const char *dlpi_name;
+  const Elf64_Phdr *dlpi_phdr;
+  Elf64_Half dlpi_phnum;
+};
 
 extern void *text_base, *data_base;
 extern void *text_virtbase;
@@ -40,5 +50,12 @@ uintptr_t so_find_rel_addr(const char *symbol);
 DynLibFunction *so_find_import(DynLibFunction *funcs, int num_funcs, const char *name);
 void so_finalize(void);
 int so_unload(void);
+
+// real dl_iterate_phdr() over every loaded module (game .so + the libc++_shared
+// donor loaded by cpplib_loader.c). Needed by libunwind/libc++ to find exception
+// unwind info when a throw/catch crosses between those modules -- without this,
+// any module that previously stubbed dl_iterate_phdr to "no modules" can crash
+// the first time the game code actually throws a C++ exception.
+int so_dl_iterate_phdr(int (*callback)(void *info, size_t size, void *data), void *data);
 
 #endif
